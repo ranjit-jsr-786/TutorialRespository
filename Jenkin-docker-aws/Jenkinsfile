@@ -1,0 +1,89 @@
+pipeline {
+    agent any
+
+    triggers {
+        pollSCM('H/5 * * * *')
+    }
+
+    tools {
+        maven 'maven-3.5.0'
+    }
+
+    environment {
+        REGISTRY_CREDENTIAL_ID = 'DOCKER_REGISTRY_CREDENTIALS'
+        GIT_URL = 'git@github.com:simoncomputing/hello-world-docker-aws.git'
+        AWS_REGION = 'us-east-1'
+        DOCKER_REGISTRY = 'https://index.docker.io/v1/'
+        ECS_CLUSTER_NAME = 'hello-world'
+
+        // look in 'CloudFormation' -> 'Output' tab for "DefaultTarget" and "ServiceRole"
+        DEFAULT_TARGET = 'arn:aws:elasticloadbalancing:us-east-1:487471999079:targetgroup/default/8eab6a3694cef2e2'
+        SERVICE_ROLE = 'ecs-service-EcsClusterStack'
+    }
+
+    stages {
+
+        stage('checkout') {
+            steps {
+                deleteDir()
+                git branch: 'master',
+                        url: "${GIT_URL}"
+            }
+        }
+
+        stage('prepare environment') {
+            steps {
+                script {
+                    DOCKER_IMAGE_NAME = sh(
+                        returnStdout: true,
+                        script: 'cat docker-compose.yml | docker run -i --rm jlordiales/jyparser get -r .services.hello_world.image'
+                    ).trim()
+
+                    DOCKER_IMAGE_AND_TAG = "${DOCKER_IMAGE_NAME}:v_${BUILD_NUMBER}"
+
+                    echo " === updating tag in docker-compose.yml === "
+                    sh "cat docker-compose.yml | docker run -i --rm jlordiales/jyparser set .services.hello_world.image \\\"${DOCKER_IMAGE_AND_TAG}\\\" | tee upd-docker-compose.yml"
+                }
+            }
+        }
+
+
+        stage('build jar') {
+            steps {
+                sh 'mvn clean package'
+            }
+        }
+
+        stage('build docker image') {
+            steps {
+                script {
+                    docker.withRegistry("${DOCKER_REGISTRY}", "${REGISTRY_CREDENTIAL_ID}") {
+                        container = docker.build("${DOCKER_IMAGE_AND_TAG}")
+                        container.push()
+                    }
+                }
+            }
+        }
+
+        stage('deploy to ecs') {
+            steps {
+                sh '''#!/bin/sh -e
+
+                    echo " === Configuring ecs-cli ==="
+                    /usr/local/bin/ecs-cli configure --region ${AWS_REGION} --cluster ${ECS_CLUSTER_NAME}
+
+                    echo " === Create/Update Service === "
+                    /usr/local/bin/ecs-cli compose --file upd-docker-compose.yml service up \
+                    --deployment-min-healthy-percent 0 \
+                    --target-group-arn ${DEFAULT_TARGET} \
+                    --container-name hello_world \
+                    --container-port 8080 \
+                    --role ${SERVICE_ROLE}
+
+                ''' // end shell script
+            }
+        }
+    }
+
+}
+
